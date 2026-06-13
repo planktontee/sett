@@ -1,0 +1,27 @@
+.{
+    .name = .sett,
+    .version = "0.0.1",
+    .dependencies = .{
+        // .zcasp = .{
+        //     .path = "dependencies/zcasp",
+        // },
+        // .regent = .{
+        //     .path = "dependencies/regent",
+        // },
+        .regent = .{
+            .url = "git+https://github.com/planktontee/regent.git#fd065246d4dc8a0f9017954551a7a73eb1b9dd4a",
+            .hash = "regent-0.0.1-zgdbw7xAAQBFT6572xfOJYd2CWsAiEqz_PQ2LLxL2Yyn",
+        },
+        .zcasp = .{
+            .url = "git+https://github.com/planktontee/zcasp.git#664b398c0340bf6598849f0848cbfc66473df5af",
+            .hash = "zcasp-0.0.1-iIb82F5GAwBSGjFvf64febiv61tVoRxjyxNSTBGZ7ieG",
+        },
+    },
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "sett.zig",
+    },
+    .fingerprint = 0xae9d072f0f83ff2,
+}
