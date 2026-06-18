@@ -12,15 +12,17 @@ pub const SetMode = enum {
 pub const Args = struct {
     mode: SetMode = .intersection,
     @"ignore-case": bool = false,
+    sorted: bool = false,
 
     pub const Short = .{
         .m = .mode,
         .i = .@"ignore-case",
+        .s = .sorted,
     };
 
     pub const Help: zcasp.help.HelpData(@This()) = .{
         .usage = &.{"sett <options> <file1> <file2> <...fileN>?"},
-        .description = "Cli to run set operations on a chain of files. Output order is sorted by default.",
+        .description = "Cli to run set operations on a chain of files. Output order is line order, unless --sorted is used.",
         .examples = &.{
             "sett file1 file2",
             "sett -m union file1 file2",
@@ -31,6 +33,7 @@ pub const Args = struct {
         .optionsDescription = &.{
             .{ .field = .mode, .description = "Set operation mode. Supported values: " ++ zcasp.help.enumValueHint(SetMode) ++ "." },
             .{ .field = .@"ignore-case", .description = "Ignores case for set operation." },
+            .{ .field = .sorted, .description = "Sorts output." },
         },
     };
 };
@@ -47,16 +50,9 @@ const Global = struct {
     stderrStream: regent.fs.FileStream(.write) = undefined,
     stdoutW: *std.Io.Writer = undefined,
     stderrW: *std.Io.Writer = undefined,
-
-    pub fn deinit(self: *const @This()) void {
-        var stderrS = self.stderrStream;
-        stderrS.deinit(self.context);
-        var stdoutS = self.stdoutStream;
-        stdoutS.deinit(self.context);
-    }
 };
 
-var global: *const Global = undefined;
+var global: Global = undefined;
 const DebugAlloc = std.heap.DebugAllocator(.{});
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -73,9 +69,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         1,
     );
 
-    // TODO: define behaviour for classes of errors
     const finalCode: u8 = result catch |e| r: {
-        std.log.err("Error: {s}\n", .{@errorName(e)});
+        const tagIn: bool = inline for (std.meta.tags(ArgsResponse.Error)) |tag| {
+            if (tag == e) break true;
+        } else false;
+        if (!tagIn) std.log.err("{s}\n", .{@errorName(e)});
+
         break :r 1;
     };
 
@@ -99,25 +98,26 @@ pub fn trampMain(init: std.process.Init.Minimal, optAlloc: ?std.mem.Allocator) !
     else
         std.heap.smp_allocator;
 
-    var g: Global = .{
-        .context = .{
-            .allocator = allocator,
-            .io = std.Io.Threaded.global_single_threaded.io(),
-        },
+    global.context = .{
+        .allocator = allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
     };
 
-    g.stdoutStream = try regent.fs.FileStream(.write).openStream(
-        g.context,
+    global.stdoutStream = try regent.fs.FileStream(.write).openStream(
+        global.context,
         std.Io.File.stdout(),
     );
-    g.stdoutW = &g.stdoutStream.stream.interface;
-    g.stderrStream = try regent.fs.FileStream(.write).openStream(
-        g.context,
+    var stdoutS = global.stdoutStream;
+    defer stdoutS.deinit(global.context);
+
+    global.stdoutW = &global.stdoutStream.stream.interface;
+    global.stderrStream = try regent.fs.FileStream(.write).openStream(
+        global.context,
         std.Io.File.stderr(),
     );
-    g.stderrW = &g.stderrStream.stream.interface;
-    global = &g;
-    defer global.deinit();
+    global.stderrW = &global.stderrStream.stream.interface;
+    var stderrS = global.stderrStream;
+    defer stderrS.deinit(global.context);
 
     var argsRes: ArgsResponse = .init(allocator);
     defer argsRes.deinit();
@@ -130,24 +130,110 @@ pub fn trampMain(init: std.process.Init.Minimal, optAlloc: ?std.mem.Allocator) !
     }
 
     if (argsRes.options.@"ignore-case")
-        try runSetOperation(true, argsRes.options.mode, argsRes.positionals.reminder)
+        try runSetOperation(true, &argsRes)
     else
-        try runSetOperation(false, argsRes.options.mode, argsRes.positionals.reminder);
+        try runSetOperation(false, &argsRes);
 
     return 0;
 }
 
 pub const RunSetOperationError = error{MissingPathsToCompare};
 
-// TODO:
-// 1. debug mode (right/left arrow) for union
-pub fn runSetOperation(comptime caseInsentitive: bool, mode: SetMode, rawPaths: ?[]const []const u8) !void {
-    const StrSet = std.HashMap(
+pub fn populateLhs(
+    comptime caseInsensitive: bool,
+    comptime sorted: bool,
+    context: regent.ergo.Context,
+    fstream: *regent.fs.FileStream(.read),
+    lhs: *StrSet(caseInsensitive),
+    lhsInLine: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var r: *std.Io.Reader = &fstream.stream.interface;
+    while (true) {
+        const line = (try r.takeDelimiter('\n')) orelse break;
+        if (sorted) {
+            if (!lhs.contains(line))
+                try lhs.put(context.allocator, try context.allocator.dupe(u8, line), {});
+        } else {
+            try lhs.put(context.allocator, line, {});
+            try lhsInLine.append(context.allocator, line);
+        }
+    }
+}
+
+pub fn operate(
+    comptime caseInsensitive: bool,
+    comptime sorted: bool,
+    mode: SetMode,
+    context: regent.ergo.Context,
+    fc: *regent.fs.FileCursor(.read),
+    lhs: *StrSet(caseInsensitive),
+    lhsInLine: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var rhs: @TypeOf(lhs.*) = .empty;
+    defer rhs.deinit(context.allocator);
+
+    while (true) {
+        var rhStream = try fc.next(context) orelse break;
+        defer {
+            rhs.clearRetainingCapacity();
+            rhStream.close(context);
+            rhStream.deinit(context);
+        }
+
+        var r: *std.Io.Reader = &rhStream.stream.interface;
+        while (true) {
+            const line = (try r.takeDelimiter('\n')) orelse break;
+            switch (mode) {
+                .@"union" => {
+                    if (!lhs.contains(line)) {
+                        const dupedLine = try context.allocator.dupe(u8, line);
+                        try lhs.put(context.allocator, dupedLine, {});
+                        if (!sorted) try lhsInLine.append(context.allocator, dupedLine);
+                    }
+                },
+                .intersection => {
+                    if (!rhs.contains(line)) try rhs.put(context.allocator, try context.allocator.dupe(u8, line), {});
+                },
+                // It's possible to shrink the old file buffer in these cases
+                // I dont know if it's worth it
+                .subtraction => {
+                    if (lhs.fetchRemove(line)) |kv| {
+                        if (sorted) context.allocator.free(kv.key);
+                    }
+                },
+            }
+        }
+
+        switch (mode) {
+            .intersection => {
+                var it = lhs.keyIterator();
+                while (it.next()) |key| {
+                    const s = key.*;
+                    if (!rhs.contains(s))
+                        if (lhs.remove(s) and sorted) context.allocator.free(s);
+                }
+
+                var rki = rhs.keyIterator();
+                while (rki.next()) |i| context.allocator.free(i.*);
+            },
+            .@"union", .subtraction => {},
+        }
+    }
+}
+
+pub fn StrSet(comptime caseInsensitive: bool) type {
+    return std.HashMapUnmanaged(
         []const u8,
         void,
-        if (caseInsentitive) regent.hash.StringInsensitiveContext else std.hash_map.StringContext,
+        if (caseInsensitive) regent.hash.StringInsensitiveContext else std.hash_map.StringContext,
         std.hash_map.default_max_load_percentage,
     );
+}
+
+pub fn runSetOperation(comptime caseInsensitive: bool, args: *const ArgsResponse) !void {
+    const mode = args.options.mode;
+    const rawPaths = args.positionals.reminder;
+    const sorted = args.options.sorted;
 
     if (rawPaths == null or rawPaths.?.len < 1) return RunSetOperationError.MissingPathsToCompare;
     const paths = if (rawPaths.?.len >= 2)
@@ -155,7 +241,7 @@ pub fn runSetOperation(comptime caseInsentitive: bool, mode: SetMode, rawPaths: 
     else
         &[_][]const u8{ "-", rawPaths.?[0] };
 
-    const headpContext: regent.ergo.Context = .{
+    const context: regent.ergo.Context = .{
         .allocator = if (builtin.mode == .Debug) global.context.allocator else std.heap.smp_allocator,
         .io = global.context.io,
     };
@@ -163,91 +249,86 @@ pub fn runSetOperation(comptime caseInsentitive: bool, mode: SetMode, rawPaths: 
     var fc = regent.fs.FileCursor(.read).initWithConfig(paths, .{ .recursive = false });
     defer fc.deinit();
 
-    var lhs: StrSet = .init(headpContext.allocator);
-    defer lhs.deinit();
+    var lhs: StrSet(caseInsensitive) = .empty;
+    defer lhs.deinit(context.allocator);
 
-    var first = try fc.next(global.context) orelse
+    // Sorted can be done with set and a double buffer copy (file -> buffer -> set) on a much smaller
+    // buffer. Order aware peration has to go over the entire file and the set later to decide to print.\
+    // so it needs a full buffer.
+    const lhsBufferType: regent.fs.BufferType = if (sorted) .byte else .full;
+    var lhsStream = try fc.nextWithConfig(
+        context,
+        .{},
+        lhsBufferType,
+        .defaultReaderConfig,
+    ) orelse
         return RunSetOperationError.MissingPathsToCompare;
+    errdefer lhsStream.deinit(context);
 
-    {
-        defer {
-            first.close(headpContext);
-            first.deinit(headpContext);
+    var lhsInLine: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lhsInLine.deinit(context.allocator);
+    var lhsInLinePopulateSize: usize = 0;
+
+    inline for (0..2) |compSorted| {
+        if ((compSorted == 0) == sorted) {
+            defer if (compSorted == 0) lhsStream.deinit(context);
+            defer lhsStream.close(context);
+
+            try populateLhs(
+                caseInsensitive,
+                compSorted == 0,
+                context,
+                &lhsStream,
+                &lhs,
+                &lhsInLine,
+            );
+
+            lhsInLinePopulateSize = lhsInLine.items.len;
+
+            try operate(
+                caseInsensitive,
+                compSorted == 0,
+                mode,
+                context,
+                &fc,
+                &lhs,
+                &lhsInLine,
+            );
+
+            break;
         }
-        var r: *std.Io.Reader = &first.stream.interface;
-        while (true) {
-            const line = (try r.takeDelimiter('\n')) orelse break;
-            try lhs.put(try headpContext.allocator.dupe(u8, line), {});
-        }
-    }
+    } else unreachable;
 
-    {
-        var rhs: StrSet = .init(headpContext.allocator);
-        defer rhs.deinit();
+    if (sorted) {
+        var all: [][]const u8 = try context.allocator.alloc([]const u8, lhs.count());
+        defer context.allocator.free(all);
 
-        while (true) {
-            var rhStream = try fc.next(global.context) orelse break;
-            defer {
-                rhs.clearRetainingCapacity();
-                rhStream.close(headpContext);
-                rhStream.deinit(headpContext);
+        var it = lhs.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |key| : (i += 1) all[i] = key.*;
+
+        std.mem.sortUnstable([]const u8, all, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
             }
+        }.lessThan);
 
-            var r: *std.Io.Reader = &rhStream.stream.interface;
-            while (true) {
-                const line = (try r.takeDelimiter('\n')) orelse break;
-                if (line.len == 0) continue;
-                switch (mode) {
-                    .@"union" => {
-                        if (!lhs.contains(line))
-                            try lhs.put(try headpContext.allocator.dupe(u8, line), {});
-                    },
-                    .intersection => try rhs.put(line, {}),
-                    // It's possible to shrink the old file buffer in these cases
-                    // I dont know if it's worth it
-                    .subtraction => {
-                        if (lhs.remove(line))
-                            headpContext.allocator.free(line);
-                    },
-                }
-            }
-
-            switch (mode) {
-                .intersection => {
-                    var it = lhs.keyIterator();
-                    while (it.next()) |key| {
-                        const s = key.*;
-                        if (!rhs.contains(s))
-                            if (lhs.remove(s))
-                                headpContext.allocator.free(s);
-                    }
-                },
-                .@"union", .subtraction => {},
-            }
+        for (all) |key| {
+            try global.stdoutW.writeAll(key);
+            try global.stdoutW.writeByte('\n');
         }
-    }
+        try global.stdoutW.flush();
 
-    var all: [][]const u8 = try headpContext.allocator.alloc([]const u8, lhs.count());
-    defer headpContext.allocator.free(all);
-
-    var it = lhs.keyIterator();
-    var i: usize = 0;
-    while (it.next()) |key| : (i += 1) all[i] = key.*;
-
-    std.mem.sortUnstable([]const u8, all, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+        for (all) |key| context.allocator.free(key);
+    } else {
+        for (lhsInLine.items, 0..) |l, i| {
+            if (lhs.contains(l)) {
+                try global.stdoutW.writeAll(l);
+                try global.stdoutW.writeByte('\n');
+            }
+            if (i >= lhsInLinePopulateSize) context.allocator.free(l);
         }
-    }.lessThan);
-
-    for (all) |key| {
-        var data: [2][]const u8 = .{
-            key,
-            "\n",
-        };
-        try global.stdoutW.writeVecAll(&data);
+        try global.stdoutW.flush();
+        lhsStream.deinit(context);
     }
-    try global.stdoutW.flush();
-
-    for (all) |key| headpContext.allocator.free(key);
 }
