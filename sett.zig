@@ -293,7 +293,7 @@ pub fn runSetOperation(comptime caseInsensitive: bool, args: *const ArgsResponse
     // buffer. Order aware operation has to go over the entire file and the set later to decide to print.
     // so it better leverages a full buffer.
     // Reminder ultimately FileStream may decide .full is impossible for streaming
-    const lhsBufferType: regent.fs.BufferType = if (sorted) .byte else .byte;
+    const lhsBufferType: regent.fs.BufferType = if (sorted) .byte else .full;
     var lhsStream = try fc.nextWithConfig(
         context,
         .{},
