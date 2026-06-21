@@ -93,10 +93,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 }
 
 pub fn trampMain(init: std.process.Init.Minimal, optAlloc: ?std.mem.Allocator) !u8 {
-    const allocator = if (optAlloc) |alloc|
-        alloc
-    else
-        std.heap.smp_allocator;
+    const allocator = if (optAlloc) |alloc| r: {
+        if (builtin.mode == .Debug) break :r alloc;
+
+        const fba: *std.heap.FixedBufferAllocator = @ptrCast(@alignCast(alloc.ptr));
+        var pfba: regent.mem.PromotingSfba = .{
+            .fallback_allocator = std.heap.smp_allocator,
+            .fixed_buffer_allocator = fba.*,
+        };
+        break :r pfba.allocator();
+    } else std.heap.smp_allocator;
 
     global.context = .{
         .allocator = allocator,
@@ -142,20 +148,39 @@ pub const RunSetOperationError = error{MissingPathsToCompare};
 pub fn populateLhs(
     comptime caseInsensitive: bool,
     comptime sorted: bool,
-    context: regent.ergo.Context,
+    allocator: std.mem.Allocator,
+    arenaContext: regent.ergo.Context,
     fstream: *regent.fs.FileStream(.read),
     lhs: *StrSet(caseInsensitive),
     lhsInLine: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    var r: *std.Io.Reader = &fstream.stream.interface;
+    const r: *std.Io.Reader = &fstream.stream.interface;
+    var resizeableBuff: std.ArrayListAlignedUnmanaged(u8, regent.fs.bufferAlignment) = .initBuffer(@alignCast(r.buffer));
+    defer {
+        var newB = resizeableBuff.items;
+        newB.len = resizeableBuff.capacity;
+        r.seek = r.seek + newB.len - r.buffer.len;
+        r.end = r.seek;
+        r.buffer = newB;
+    }
+
     while (true) {
-        const line = (try r.takeDelimiter('\n')) orelse break;
+        const line = (try fstream.readLineRetained(allocator, &resizeableBuff)) orelse break;
         if (sorted) {
             if (!lhs.contains(line))
-                try lhs.put(context.allocator, try context.allocator.dupe(u8, line), {});
+                if (fstream.bufferType == .full)
+                    try lhs.put(arenaContext.allocator, line, {})
+                else
+                    try lhs.put(arenaContext.allocator, try arenaContext.allocator.dupe(u8, line), {});
         } else {
-            try lhs.put(context.allocator, line, {});
-            try lhsInLine.append(context.allocator, line);
+            if (fstream.bufferType == .full) {
+                try lhs.put(arenaContext.allocator, line, {});
+                try lhsInLine.append(arenaContext.allocator, line);
+            } else {
+                const duped = try arenaContext.allocator.dupe(u8, line);
+                try lhs.put(arenaContext.allocator, duped, {});
+                try lhsInLine.append(arenaContext.allocator, duped);
+            }
         }
     }
 }
@@ -165,6 +190,7 @@ pub fn operate(
     comptime sorted: bool,
     mode: SetMode,
     context: regent.ergo.Context,
+    lhsArena: std.mem.Allocator,
     fc: *regent.fs.FileCursor(.read),
     lhs: *StrSet(caseInsensitive),
     lhsInLine: *std.ArrayListUnmanaged([]const u8),
@@ -172,35 +198,42 @@ pub fn operate(
     var rhs: @TypeOf(lhs.*) = .empty;
     defer rhs.deinit(context.allocator);
 
+    var resizeableBuff: std.ArrayListAlignedUnmanaged(u8, regent.fs.oDirectAlignment) = try .initCapacity(
+        context.allocator,
+        regent.fs.BufferConfig.defaultReaderConfig.fileBufferSize,
+    );
+    defer resizeableBuff.deinit(context.allocator);
+
     while (true) {
-        var rhStream = try fc.next(context) orelse break;
+        var rhStream = try fc.nextUnmanaged(context) orelse break;
+        rhStream.setBuffer(regent.fs.oDirectAlignment, resizeableBuff.allocatedSlice());
         defer {
             rhs.clearRetainingCapacity();
             rhStream.close(context);
-            rhStream.deinit(context);
         }
 
-        var r: *std.Io.Reader = &rhStream.stream.interface;
+        var rhsArena = std.heap.ArenaAllocator.init(context.allocator);
+        const rhsArenaAlloc = rhsArena.allocator();
+        defer rhsArena.deinit();
+
         while (true) {
-            const line = (try r.takeDelimiter('\n')) orelse break;
+            const line = (try rhStream.readLineRetained(context.allocator, &resizeableBuff)) orelse break;
             switch (mode) {
                 .@"union" => {
                     if (!lhs.contains(line)) {
-                        const dupedLine = try context.allocator.dupe(u8, line);
-                        try lhs.put(context.allocator, dupedLine, {});
-                        if (!sorted) try lhsInLine.append(context.allocator, dupedLine);
+                        const dupedLine = try lhsArena.dupe(u8, line);
+                        try lhs.put(lhsArena, dupedLine, {});
+                        if (!sorted) try lhsInLine.append(lhsArena, dupedLine);
                     }
                 },
                 .intersection => {
-                    if (!rhs.contains(line)) try rhs.put(context.allocator, try context.allocator.dupe(u8, line), {});
+                    if (!rhs.contains(line))
+                        try rhs.put(context.allocator, try rhsArenaAlloc.dupe(u8, line), {});
                 },
                 // It's possible to shrink the old file buffer in these cases
                 // I dont know if it's worth it
-                .subtraction => {
-                    if (lhs.fetchRemove(line)) |kv| {
-                        if (sorted) context.allocator.free(kv.key);
-                    }
-                },
+                // freeing is handled by lhsArena
+                .subtraction => _ = lhs.remove(line),
             }
         }
 
@@ -210,11 +243,10 @@ pub fn operate(
                 while (it.next()) |key| {
                     const s = key.*;
                     if (!rhs.contains(s))
-                        if (lhs.remove(s) and sorted) context.allocator.free(s);
+                        // freeing is handled by lhsArena
+                        _ = lhs.remove(s);
                 }
-
-                var rki = rhs.keyIterator();
-                while (rki.next()) |i| context.allocator.free(i.*);
+                // freeing rhs copies is handled by rhsArena
             },
             .@"union", .subtraction => {},
         }
@@ -241,55 +273,61 @@ pub fn runSetOperation(comptime caseInsensitive: bool, args: *const ArgsResponse
     else
         &[_][]const u8{ "-", rawPaths.?[0] };
 
-    const context: regent.ergo.Context = .{
-        .allocator = if (builtin.mode == .Debug) global.context.allocator else std.heap.smp_allocator,
-        .io = global.context.io,
-    };
+    const context: regent.ergo.Context = global.context;
 
     var fc = regent.fs.FileCursor(.read).initWithConfig(paths, .{ .recursive = false });
     defer fc.deinit();
 
+    var arena = std.heap.ArenaAllocator.init(context.allocator);
+    const lhsArena = arena.allocator();
+    defer arena.deinit();
+
+    const arenaContext: regent.ergo.Context = .{ .io = context.io, .allocator = lhsArena };
+
+    // lhs and lhsInLine and copied file lines will stay inside the Arena because all of them have the
+    // same lifecycle and are only 'disposable' together
     var lhs: StrSet(caseInsensitive) = .empty;
-    defer lhs.deinit(context.allocator);
+    defer lhs.deinit(lhsArena);
 
     // Sorted can be done with set and a double buffer copy (file -> buffer -> set) on a much smaller
-    // buffer. Order aware peration has to go over the entire file and the set later to decide to print.\
-    // so it needs a full buffer.
-    const lhsBufferType: regent.fs.BufferType = if (sorted) .byte else .full;
+    // buffer. Order aware operation has to go over the entire file and the set later to decide to print.
+    // so it better leverages a full buffer.
+    // Reminder ultimately FileStream may decide .full is impossible for streaming
+    const lhsBufferType: regent.fs.BufferType = if (sorted) .byte else .byte;
     var lhsStream = try fc.nextWithConfig(
         context,
         .{},
         lhsBufferType,
         .defaultReaderConfig,
-    ) orelse
-        return RunSetOperationError.MissingPathsToCompare;
-    errdefer lhsStream.deinit(context);
+    ) orelse return RunSetOperationError.MissingPathsToCompare;
+    defer {
+        lhsStream.deinit(context);
+        lhsStream.close(context);
+    }
 
     var lhsInLine: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer lhsInLine.deinit(context.allocator);
-    var lhsInLinePopulateSize: usize = 0;
+    defer lhsInLine.deinit(lhsArena);
 
-    inline for (0..2) |compSorted| {
-        if ((compSorted == 0) == sorted) {
-            defer if (compSorted == 0) lhsStream.deinit(context);
-            defer lhsStream.close(context);
+    inline for (0..2) |compBool| {
+        if ((compBool == 1) == sorted) {
+            const cSorted = compBool == 1;
 
             try populateLhs(
                 caseInsensitive,
-                compSorted == 0,
-                context,
+                cSorted,
+                context.allocator,
+                arenaContext,
                 &lhsStream,
                 &lhs,
                 &lhsInLine,
             );
 
-            lhsInLinePopulateSize = lhsInLine.items.len;
-
             try operate(
                 caseInsensitive,
-                compSorted == 0,
+                cSorted,
                 mode,
                 context,
+                lhsArena,
                 &fc,
                 &lhs,
                 &lhsInLine,
@@ -319,16 +357,15 @@ pub fn runSetOperation(comptime caseInsensitive: bool, args: *const ArgsResponse
         }
         try global.stdoutW.flush();
 
-        for (all) |key| context.allocator.free(key);
+        // Final freeing is done by lhsArena
     } else {
-        for (lhsInLine.items, 0..) |l, i| {
+        for (lhsInLine.items) |l| {
             if (lhs.contains(l)) {
                 try global.stdoutW.writeAll(l);
                 try global.stdoutW.writeByte('\n');
             }
-            if (i >= lhsInLinePopulateSize) context.allocator.free(l);
         }
         try global.stdoutW.flush();
-        lhsStream.deinit(context);
+        // Final freeing is done by lhsArena
     }
 }
