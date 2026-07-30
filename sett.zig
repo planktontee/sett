@@ -60,13 +60,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var da: DebugAlloc = .{};
         const allocator = da.allocator();
 
-        break :r trampMain(init, allocator);
+        break :r trampMain(.{ allocator, init });
     } else regent.trampoline.stackTrampoline(
-        @typeInfo(@TypeOf(trampMain)).@"fn".return_type.?,
         u6,
-        init,
-        trampMain,
         1,
+        trampMain,
+        .{ null, init },
     );
 
     const finalCode: u8 = result catch |e| r: {
@@ -92,7 +91,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     return finalCode;
 }
 
-pub fn trampMain(init: std.process.Init.Minimal, optAlloc: ?std.mem.Allocator) !u8 {
+pub fn trampMain(args: struct { ?std.mem.Allocator, std.process.Init.Minimal }) !u8 {
+    const optAlloc, const init = args;
     const allocator = if (optAlloc) |alloc| r: {
         if (builtin.mode == .Debug) break :r alloc;
 
@@ -145,6 +145,7 @@ pub fn trampMain(init: std.process.Init.Minimal, optAlloc: ?std.mem.Allocator) !
 
 pub const RunSetOperationError = error{MissingPathsToCompare};
 
+// lhs always pays top memory price for its lines (whole file and maybe growth factor padding)
 pub fn populateLhs(
     comptime caseInsensitive: bool,
     comptime sorted: bool,
@@ -155,32 +156,39 @@ pub fn populateLhs(
     lhsInLine: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     const r: *std.Io.Reader = &fstream.stream.interface;
-    var resizeableBuff: std.ArrayListAlignedUnmanaged(u8, regent.fs.bufferAlignment) = .initBuffer(@alignCast(r.buffer));
+    const initialBuffer = r.buffer;
+    // This alignment could technically be off, based on what's inside fstream
+    var resizeable: std.ArrayListAlignedUnmanaged(u8, regent.fs.bufferAlignment) = .initBuffer(@alignCast(r.buffer));
+    errdefer resizeable.deinit(allocator);
     defer {
-        var newB = resizeableBuff.items;
-        newB.len = resizeableBuff.capacity;
-        r.seek = r.seek + newB.len - r.buffer.len;
-        r.end = r.seek;
-        r.buffer = newB;
+        if (fstream.bufferType == .full) {
+            r.buffer = initialBuffer;
+            r.seek = initialBuffer.len - 1;
+            r.end = r.seek;
+        } else {
+            // this ensures it can be freed later as part of fstream, owning resizeable's internals
+            const newB = resizeable.allocatedSlice();
+            r.seek = r.seek + newB.len - r.buffer.len;
+            r.end = r.seek;
+            r.buffer = newB;
+        }
     }
 
     while (true) {
-        const line = (try fstream.readLineRetained(allocator, &resizeableBuff)) orelse break;
-        if (sorted) {
-            if (!lhs.contains(line))
-                if (fstream.bufferType == .full)
-                    try lhs.put(arenaContext.allocator, line, {})
-                else
-                    try lhs.put(arenaContext.allocator, try arenaContext.allocator.dupe(u8, line), {});
+        if (fstream.bufferType == .full) {
+            // this is technically super bad, but we are guaranteed to never expand on full
+            const line = (try fstream.readLineRetained(
+                allocator,
+                @constCast(&@as(std.ArrayList(u8), .empty)),
+            )) orelse break;
+
+            try lhs.put(arenaContext.allocator, line, {});
+            if (!sorted) try lhsInLine.append(arenaContext.allocator, line);
         } else {
-            if (fstream.bufferType == .full) {
-                try lhs.put(arenaContext.allocator, line, {});
-                try lhsInLine.append(arenaContext.allocator, line);
-            } else {
-                const duped = try arenaContext.allocator.dupe(u8, line);
-                try lhs.put(arenaContext.allocator, duped, {});
-                try lhsInLine.append(arenaContext.allocator, duped);
-            }
+            const line = (try fstream.readLineRetained(allocator, &resizeable)) orelse break;
+
+            try lhs.put(arenaContext.allocator, line, {});
+            if (!sorted) try lhsInLine.append(arenaContext.allocator, line);
         }
     }
 }
@@ -217,8 +225,10 @@ pub fn operate(
         defer rhsArena.deinit();
 
         while (true) {
+            // readLineRetained is used here purely as a way to amortize buffer growth and keep the buffer big for subsequent reads
             const line = (try rhStream.readLineRetained(context.allocator, &resizeableBuff)) orelse break;
             switch (mode) {
+                // 2x copy, but that's necessary, unless we keep all files in mem which is extremely wasteful
                 .@"union" => {
                     if (!lhs.contains(line)) {
                         const dupedLine = try lhsArena.dupe(u8, line);
@@ -226,6 +236,7 @@ pub fn operate(
                         if (!sorted) try lhsInLine.append(lhsArena, dupedLine);
                     }
                 },
+                // 2x copy, but that's necessary, unless we keep all files in mem which is extremely wasteful
                 .intersection => {
                     if (!rhs.contains(line))
                         try rhs.put(context.allocator, try rhsArenaAlloc.dupe(u8, line), {});
@@ -308,34 +319,49 @@ pub fn runSetOperation(comptime caseInsensitive: bool, args: *const ArgsResponse
     var lhsInLine: std.ArrayListUnmanaged([]const u8) = .empty;
     defer lhsInLine.deinit(lhsArena);
 
-    inline for (0..2) |compBool| {
-        if ((compBool == 1) == sorted) {
-            const cSorted = compBool == 1;
+    if (sorted) {
+        try populateLhs(
+            caseInsensitive,
+            true,
+            context.allocator,
+            arenaContext,
+            &lhsStream,
+            &lhs,
+            &lhsInLine,
+        );
 
-            try populateLhs(
-                caseInsensitive,
-                cSorted,
-                context.allocator,
-                arenaContext,
-                &lhsStream,
-                &lhs,
-                &lhsInLine,
-            );
+        try operate(
+            caseInsensitive,
+            true,
+            mode,
+            context,
+            lhsArena,
+            &fc,
+            &lhs,
+            &lhsInLine,
+        );
+    } else {
+        try populateLhs(
+            caseInsensitive,
+            false,
+            context.allocator,
+            arenaContext,
+            &lhsStream,
+            &lhs,
+            &lhsInLine,
+        );
 
-            try operate(
-                caseInsensitive,
-                cSorted,
-                mode,
-                context,
-                lhsArena,
-                &fc,
-                &lhs,
-                &lhsInLine,
-            );
-
-            break;
-        }
-    } else unreachable;
+        try operate(
+            caseInsensitive,
+            false,
+            mode,
+            context,
+            lhsArena,
+            &fc,
+            &lhs,
+            &lhsInLine,
+        );
+    }
 
     if (sorted) {
         var all: [][]const u8 = try context.allocator.alloc([]const u8, lhs.count());
@@ -353,7 +379,8 @@ pub fn runSetOperation(comptime caseInsensitive: bool, args: *const ArgsResponse
 
         for (all) |key| {
             try global.stdoutW.writeAll(key);
-            try global.stdoutW.writeByte('\n');
+            if (key[key.len - 1] != '\n')
+                try global.stdoutW.writeByte('\n');
         }
         try global.stdoutW.flush();
 
@@ -362,10 +389,164 @@ pub fn runSetOperation(comptime caseInsensitive: bool, args: *const ArgsResponse
         for (lhsInLine.items) |l| {
             if (lhs.contains(l)) {
                 try global.stdoutW.writeAll(l);
-                try global.stdoutW.writeByte('\n');
+                if (l[l.len - 1] != '\n')
+                    try global.stdoutW.writeByte('\n');
             }
         }
         try global.stdoutW.flush();
         // Final freeing is done by lhsArena
     }
+}
+
+const testing = std.testing;
+
+fn makeFile(
+    dir: std.Io.Dir,
+    io: std.Io,
+    name: []const u8,
+    content: []const []const u8,
+) !std.Io.File {
+    const f = try dir.createFile(io, name, .{ .read = true });
+    errdefer f.close(io);
+
+    var buf: [regent.fs.BufferConfig.defaultWriterConfig.fileBufferSize]u8 = undefined;
+
+    var fw = f.writer(testing.io, &buf);
+    const w = &fw.interface;
+
+    for (content) |line| {
+        try w.writeAll(line);
+    }
+    try w.flush();
+
+    return f;
+}
+
+test "populateLhs for byte resizes to track lines" {
+    var tmpDir = testing.tmpDir(.{});
+    defer tmpDir.cleanup();
+
+    const content = &.{
+        // 23
+        "aaaaaaaaaaaaaaaaaaaaaa\n",
+        // 22
+        "bbbbbbbbbbbbbbbbbbbbb\n",
+        "bbbbbbbbbbbbbbbbbbbbb\n",
+        // 21
+        "cccccccccccccccccccc\n",
+    };
+    const f = try makeFile(tmpDir.dir, testing.io, "resizeByte", content);
+    defer f.close(testing.io);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+
+    var lhs: StrSet(true) = .empty;
+    defer lhs.deinit(arenaAlloc);
+
+    const context: regent.ergo.Context = .{ .io = testing.io, .allocator = testing.allocator };
+
+    var lhsStream = try regent.fs.FileStream(.read).openStreamWithConfig(
+        context,
+        f,
+        .{},
+        .byte,
+        .initSame(1),
+        null,
+    );
+    defer lhsStream.deinit(context);
+
+    var lhsInLine: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lhsInLine.deinit(arenaAlloc);
+
+    try populateLhs(
+        true,
+        false,
+        testing.allocator,
+        .{ .io = testing.io, .allocator = arenaAlloc },
+        &lhsStream,
+        &lhs,
+        &lhsInLine,
+    );
+
+    for (@as([]const []const u8, &.{
+        "aaaaaaaaaaaaaaaaaaaaaa\n",
+        "bbbbbbbbbbbbbbbbbbbbb\n",
+        "cccccccccccccccccccc\n",
+    })) |line| {
+        try testing.expect(lhs.contains(line));
+    }
+    try testing.expectEqual(3, lhs.size);
+
+    for (@as([]const []const u8, content), lhsInLine.items) |expect, line| {
+        try testing.expectEqualStrings(expect, line);
+    }
+    try testing.expectEqual(content.len, lhsInLine.items.len);
+    // buffer actually grows to be file-sized by growth factor
+    try testing.expectEqual(131, lhsStream.stream.interface.buffer.len);
+}
+
+test "populateLhs for full doesnt resize" {
+    var tmpDir = testing.tmpDir(.{});
+    defer tmpDir.cleanup();
+
+    const content = &.{
+        // 8
+        "aaaaaaa\n",
+        // 5
+        "aaaa\n",
+        "aaaaaaa\n",
+        "aaaa\n",
+        "bb",
+    };
+    const f = try makeFile(tmpDir.dir, testing.io, "resizeFull", content);
+    defer f.close(testing.io);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+
+    var lhs: StrSet(true) = .empty;
+    defer lhs.deinit(arenaAlloc);
+
+    const context: regent.ergo.Context = .{ .io = testing.io, .allocator = testing.allocator };
+
+    var lhsStream = try regent.fs.FileStream(.read).openStreamWithConfig(
+        context,
+        f,
+        .{},
+        .full,
+        .defaultReaderConfig,
+        null,
+    );
+    defer lhsStream.deinit(context);
+
+    var lhsInLine: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lhsInLine.deinit(arenaAlloc);
+
+    try populateLhs(
+        true,
+        false,
+        testing.allocator,
+        .{ .io = testing.io, .allocator = arenaAlloc },
+        &lhsStream,
+        &lhs,
+        &lhsInLine,
+    );
+
+    try testing.expectEqual(3, lhs.size);
+    for (@as([]const []const u8, &.{
+        "aaaaaaa\n",
+        "aaaa\n",
+        "bb",
+    })) |line| {
+        try testing.expect(lhs.contains(line));
+    }
+
+    for (@as([]const []const u8, content), lhsInLine.items) |expect, line| {
+        try testing.expectEqualStrings(expect, line);
+    }
+    try testing.expectEqual(content.len, lhsInLine.items.len);
+    try testing.expectEqual(28, lhsStream.stream.interface.buffer.len);
 }
