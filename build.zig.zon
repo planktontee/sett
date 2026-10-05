@@ -13,8 +13,8 @@
             .hash = "regent-0.0.1-zgdbw1idAgC4JCqP1uWrgua3ygJEeN4xlLVDaflG9JJ6",
         },
         .zcasp = .{
-            .url = "git+https://github.com/planktontee/zcasp.git#e552d8b864be0209d59b7f1619639b8aa2f088dc",
-            .hash = "zcasp-0.0.1-iIb82F5GAwDZ56GB9-quJo0m0iI-GQBY3KdZTUNeNWZY",
+            .url = "git+https://github.com/planktontee/zcasp.git#04e7775da647d11e47586d70deae7130d8d4febf",
+            .hash = "zcasp-0.0.1-iIb82MQVBADOGuJZ3NIvtqIWmex1J5E2QPbxNCc6_rUp",
         },
     },
     .minimum_zig_version = "0.16.0",
